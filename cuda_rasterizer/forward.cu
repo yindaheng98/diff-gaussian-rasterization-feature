@@ -271,7 +271,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, uint32_t SEMANTIC_CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -279,11 +279,13 @@ renderCUDA(
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ semantics,
 	const float4* __restrict__ conic_opacity,
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
+	float* __restrict__ out_feature_map,
 	const float* __restrict__ depths,
 	float* __restrict__ invdepth)
 {
@@ -316,6 +318,7 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float S[SEMANTIC_CHANNELS] = { 0 };
 
 	float expected_invdepth = 0.0f;
 
@@ -370,6 +373,8 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+			for (int ch = 0; ch < SEMANTIC_CHANNELS; ch++)
+				S[ch] += semantics[collected_id[j] * SEMANTIC_CHANNELS + ch] * alpha * T; 
 
 			if(invdepth)
 			expected_invdepth += (1 / depths[collected_id[j]]) * alpha * T;
@@ -390,6 +395,8 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		for (int ch = 0; ch < SEMANTIC_CHANNELS; ch++)                 
+			out_feature_map[ch * H * W + pix_id] = S[ch];
 
 		if (invdepth)
 		invdepth[pix_id] = expected_invdepth;// 1. / (expected_depth + T * 1e3);
@@ -403,25 +410,29 @@ void FORWARD::render(
 	int W, int H,
 	const float2* means2D,
 	const float* colors,
+	const float* semantics,
 	const float4* conic_opacity,
 	float* final_T,
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
+	float* out_feature_map,
 	float* depths,
 	float* depth)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	renderCUDA<NUM_CHANNELS, NUM_SEMANTIC_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
 		W, H,
 		means2D,
 		colors,
+		semantics,
 		conic_opacity,
 		final_T,
 		n_contrib,
 		bg_color,
 		out_color,
+		out_feature_map,
 		depths, 
 		depth);
 }

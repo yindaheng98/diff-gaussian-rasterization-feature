@@ -13,6 +13,7 @@
 #define CUDA_RASTERIZER_CONFIG_H_INCLUDED
 
 #define NUM_CHANNELS 3 // Default 3, RGB
+#define NUM_SEMANTIC_CHANNELS 16 // Subject to change. Max shared memory size is 102400
 #define BLOCK_X 16
 #define BLOCK_Y 16
 
