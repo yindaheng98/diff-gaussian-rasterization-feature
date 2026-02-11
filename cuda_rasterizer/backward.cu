@@ -449,12 +449,12 @@ __global__ void preprocessCUDA(
 }
 
 // Backward version of the rendering procedure.
-template <uint32_t C, uint32_t S>
+template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	int W, int H, int S,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
@@ -491,11 +491,19 @@ renderCUDA(
 	bool done = !inside;
 	int toDo = range.y - range.x;
 
+	// Dynamic shared memory layout:
+	// [0, S*BLOCK_SIZE)             : collected_semantics
+	// [S*BLOCK_SIZE, 2*S*BLOCK_SIZE): accum_semantics_rec (per-thread, contiguous per thread)
+	// [2*S*BLOCK_SIZE, 3*S*BLOCK_SIZE): dL_dsemanticpixel (per-thread)
+	// [3*S*BLOCK_SIZE, 4*S*BLOCK_SIZE): last_semantics (per-thread)
+	extern __shared__ float s_shared[];
+	const int tid = block.thread_rank();
+
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
-	__shared__ float collected_semantics[S * BLOCK_SIZE];
+	float* collected_semantics = s_shared;
 	__shared__ float collected_depths[BLOCK_SIZE];
 
 
@@ -510,9 +518,11 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
-	float accum_semantics_rec[S] = { 0 };
+	float* accum_semantics_rec = s_shared + S * BLOCK_SIZE + tid * S;
+	for (int i = 0; i < S; i++)
+		accum_semantics_rec[i] = 0;
 	float dL_dpixel[C];
-	float dL_dsemanticpixel[S];
+	float* dL_dsemanticpixel = s_shared + 2 * S * BLOCK_SIZE + tid * S;
 	float dL_invdepth;
 	float accum_invdepth_rec = 0;
 	if (inside)
@@ -527,7 +537,9 @@ renderCUDA(
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
-	float last_semantics[S] = { 0 };
+	float* last_semantics = s_shared + 3 * S * BLOCK_SIZE + tid * S;
+	for (int i = 0; i < S; i++)
+		last_semantics[i] = 0;
 	float last_invdepth = 0;
 
 
@@ -743,7 +755,7 @@ void BACKWARD::render(
 	const dim3 grid, const dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, int S,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
@@ -762,10 +774,11 @@ void BACKWARD::render(
 	float* dL_dsemantics,
 	float* dL_dinvdepths)
 {
-	renderCUDA<NUM_CHANNELS, NUM_SEMANTIC_CHANNELS> << <grid, block >> >(
+	size_t shared_mem_size = 4 * S * BLOCK_SIZE * sizeof(float);
+	renderCUDA<NUM_CHANNELS> << <grid, block, shared_mem_size >> >(
 		ranges,
 		point_list,
-		W, H,
+		W, H, S,
 		bg_color,
 		means2D,
 		conic_opacity,

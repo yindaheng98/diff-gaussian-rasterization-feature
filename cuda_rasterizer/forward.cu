@@ -271,12 +271,12 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS, uint32_t SEMANTIC_CHANNELS>
+template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	int W, int H, int SEMANTIC_CHANNELS,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ semantics,
@@ -318,7 +318,12 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
-	float S[SEMANTIC_CHANNELS] = { 0 };
+
+	// Dynamic shared memory for per-thread semantic accumulators
+	extern __shared__ float s_semantic[];
+	float* S = s_semantic + block.thread_rank() * SEMANTIC_CHANNELS;
+	for (int ch = 0; ch < SEMANTIC_CHANNELS; ch++)
+		S[ch] = 0;
 
 	float expected_invdepth = 0.0f;
 
@@ -407,7 +412,7 @@ void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, int S,
 	const float2* means2D,
 	const float* colors,
 	const float* semantics,
@@ -420,10 +425,11 @@ void FORWARD::render(
 	float* depths,
 	float* depth)
 {
-	renderCUDA<NUM_CHANNELS, NUM_SEMANTIC_CHANNELS> << <grid, block >> > (
+	size_t shared_mem_size = S * BLOCK_SIZE * sizeof(float);
+	renderCUDA<NUM_CHANNELS> << <grid, block, shared_mem_size >> > (
 		ranges,
 		point_list,
-		W, H,
+		W, H, S,
 		means2D,
 		colors,
 		semantics,
