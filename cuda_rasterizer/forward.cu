@@ -426,6 +426,10 @@ void FORWARD::render(
 	float* depth)
 {
 	size_t shared_mem_size = S * BLOCK_SIZE * sizeof(float);
+	cudaFuncSetAttribute(
+		renderCUDA<NUM_CHANNELS>,
+		cudaFuncAttributeMaxDynamicSharedMemorySize,
+		shared_mem_size); // shared memory size limit ~100KB
 	renderCUDA<NUM_CHANNELS> << <grid, block, shared_mem_size >> > (
 		ranges,
 		point_list,
