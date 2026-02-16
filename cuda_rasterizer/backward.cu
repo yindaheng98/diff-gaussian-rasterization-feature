@@ -471,7 +471,12 @@ renderCUDA(
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
 	float* __restrict__ dL_dsemantics,
-	float* __restrict__ dL_dinvdepths
+	float* __restrict__ dL_dinvdepths,
+	// Per-pixel semantic buffers in global memory (layout [H*W, S])
+	// so that there is no shared-memory limit on S.
+	float* __restrict__ accum_semantics_rec_buf,
+	float* __restrict__ last_semantics_buf,
+	float* __restrict__ dL_dsemanticpixel_buf
 )
 {
 	// We rasterize again. Compute necessary block info.
@@ -491,19 +496,10 @@ renderCUDA(
 	bool done = !inside;
 	int toDo = range.y - range.x;
 
-	// Dynamic shared memory layout:
-	// [0, S*BLOCK_SIZE)             : collected_semantics
-	// [S*BLOCK_SIZE, 2*S*BLOCK_SIZE): accum_semantics_rec (per-thread, contiguous per thread)
-	// [2*S*BLOCK_SIZE, 3*S*BLOCK_SIZE): dL_dsemanticpixel (per-thread)
-	// [3*S*BLOCK_SIZE, 4*S*BLOCK_SIZE): last_semantics (per-thread)
-	extern __shared__ float s_shared[];
-	const int tid = block.thread_rank();
-
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
-	float* collected_semantics = s_shared;
 	__shared__ float collected_depths[BLOCK_SIZE];
 
 
@@ -518,11 +514,14 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
-	float* accum_semantics_rec = s_shared + S * BLOCK_SIZE + tid * S;
-	for (int i = 0; i < S; i++)
-		accum_semantics_rec[i] = 0;
+	// Per-pixel pointers into global-memory buffers (layout [H*W, S]).
+	// Indexing with [ch] works the same as the original shared-memory version.
+	float* accum_semantics_rec = accum_semantics_rec_buf + pix_id * S;
+	float* last_semantics = last_semantics_buf + pix_id * S;
 	float dL_dpixel[C];
-	float* dL_dsemanticpixel = s_shared + 2 * S * BLOCK_SIZE + tid * S;
+	// Pre-load per-pixel semantic gradient from channel-first [S, H*W] layout
+	// into contiguous [H*W, S] buffer once, so the inner loop reads are cache-friendly.
+	float* dL_dsemanticpixel = dL_dsemanticpixel_buf + pix_id * S;
 	float dL_invdepth;
 	float accum_invdepth_rec = 0;
 	if (inside)
@@ -537,9 +536,6 @@ renderCUDA(
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
-	float* last_semantics = s_shared + 3 * S * BLOCK_SIZE + tid * S;
-	for (int i = 0; i < S; i++)
-		last_semantics[i] = 0;
 	float last_invdepth = 0;
 
 
@@ -563,8 +559,6 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
-			for (int i = 0; i < S; i++)
-				collected_semantics[i * BLOCK_SIZE + block.thread_rank()] = semantics[coll_id * S + i];
 
 			if(dL_invdepths)
 			collected_depths[block.thread_rank()] = depths[coll_id];
@@ -618,7 +612,7 @@ renderCUDA(
 			}
 			for (int ch = 0; ch < S; ch++)
 			{
-				const float f = collected_semantics[ch * BLOCK_SIZE + j];
+				const float f = semantics[global_id * S + ch];
 				// Update last semantic feature (to be used in the next iteration)
 				accum_semantics_rec[ch] = last_alpha * last_semantics[ch] + (1.f - last_alpha) * accum_semantics_rec[ch];
 				last_semantics[ch] = f;
@@ -774,12 +768,20 @@ void BACKWARD::render(
 	float* dL_dsemantics,
 	float* dL_dinvdepths)
 {
-	size_t shared_mem_size = 4 * S * BLOCK_SIZE * sizeof(float);
-	cudaFuncSetAttribute(
-		renderCUDA<NUM_CHANNELS>,
-		cudaFuncAttributeMaxDynamicSharedMemorySize,
-		shared_mem_size); // shared memory size limit ~100KB
-	renderCUDA<NUM_CHANNELS> << <grid, block, shared_mem_size >> >(
+	// Allocate per-pixel semantic buffers in global memory
+	// (layout [H*W, S]) so there is no shared-memory limit on S.
+	const size_t sem_buf_bytes = (size_t)S * H * W * sizeof(float);
+	float* accum_semantics_rec  = nullptr;
+	float* last_semantics       = nullptr;
+	float* dL_dsemanticpixel    = nullptr;
+	cudaMalloc(&accum_semantics_rec,  sem_buf_bytes);
+	cudaMalloc(&last_semantics,       sem_buf_bytes);
+	cudaMalloc(&dL_dsemanticpixel,    sem_buf_bytes);
+	cudaMemset(accum_semantics_rec, 0, sem_buf_bytes);
+	cudaMemset(last_semantics,      0, sem_buf_bytes);
+	cudaMemset(dL_dsemanticpixel,   0, sem_buf_bytes);
+
+	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H, S,
@@ -799,6 +801,13 @@ void BACKWARD::render(
 		dL_dopacity,
 		dL_dcolors,
 		dL_dsemantics,
-		dL_dinvdepths
+		dL_dinvdepths,
+		accum_semantics_rec,
+		last_semantics,
+		dL_dsemanticpixel
 		);
+
+	cudaFree(accum_semantics_rec);
+	cudaFree(last_semantics);
+	cudaFree(dL_dsemanticpixel);
 }

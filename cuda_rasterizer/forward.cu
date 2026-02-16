@@ -287,7 +287,9 @@ renderCUDA(
 	float* __restrict__ out_color,
 	float* __restrict__ out_feature_map,
 	const float* __restrict__ depths,
-	float* __restrict__ invdepth)
+	float* __restrict__ invdepth,
+	// Per-pixel semantic accumulator in global memory (layout [H*W, S]).
+	float* __restrict__ sem_accum_buf)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -319,11 +321,10 @@ renderCUDA(
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
 
-	// Dynamic shared memory for per-thread semantic accumulators
-	extern __shared__ float s_semantic[];
-	float* S = s_semantic + block.thread_rank() * SEMANTIC_CHANNELS;
-	for (int ch = 0; ch < SEMANTIC_CHANNELS; ch++)
-		S[ch] = 0;
+	// Per-pixel pointer into contiguous [H*W, S] accumulator buffer.
+	// Accumulating here (S floats contiguous) is cache-friendly,
+	// unlike writing directly to channel-first out_feature_map.
+	float* S = sem_accum_buf + pix_id * SEMANTIC_CHANNELS;
 
 	float expected_invdepth = 0.0f;
 
@@ -425,12 +426,12 @@ void FORWARD::render(
 	float* depths,
 	float* depth)
 {
-	size_t shared_mem_size = S * BLOCK_SIZE * sizeof(float);
-	cudaFuncSetAttribute(
-		renderCUDA<NUM_CHANNELS>,
-		cudaFuncAttributeMaxDynamicSharedMemorySize,
-		shared_mem_size); // shared memory size limit ~100KB
-	renderCUDA<NUM_CHANNELS> << <grid, block, shared_mem_size >> > (
+	const size_t sem_buf_bytes = (size_t)S * W * H * sizeof(float);
+	float* sem_accum_buf = nullptr;
+	cudaMalloc(&sem_accum_buf, sem_buf_bytes);
+	cudaMemset(sem_accum_buf, 0, sem_buf_bytes);
+
+	renderCUDA<NUM_CHANNELS> << <grid, block>> > (
 		ranges,
 		point_list,
 		W, H, S,
@@ -444,7 +445,10 @@ void FORWARD::render(
 		out_color,
 		out_feature_map,
 		depths, 
-		depth);
+		depth,
+		sem_accum_buf);
+
+	cudaFree(sem_accum_buf);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
