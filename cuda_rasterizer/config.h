@@ -16,4 +16,9 @@
 #define BLOCK_X 16
 #define BLOCK_Y 16
 
+// When number of semantic channels exceeds shared memory capacity but is within this limit,
+// per-thread local arrays (register/L1-cached stack memory) are used
+// as a middle tier between shared memory and global memory.
+#define MAX_LOCAL_SEMANTIC_CHANNELS 64
+
 #endif

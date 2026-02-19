@@ -13,6 +13,7 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <array>
 namespace cg = cooperative_groups;
 
 // Forward method for converting the input spherical harmonics
@@ -271,7 +272,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+template <uint32_t CHANNELS, uint32_t LOCAL_SEMANTIC_CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -325,8 +326,13 @@ renderCUDA(
 	// Dynamic shared memory for per-thread semantic accumulators
 	extern __shared__ float s_semantic[];
 	float* S = s_semantic + block.thread_rank() * SEMANTIC_CHANNELS;
+	float S_local[LOCAL_SEMANTIC_CHANNELS > 0 ? LOCAL_SEMANTIC_CHANNELS : 1] = { 0 };
+	// sem_accum_buf: global memory buffer (unlimited)
 	if (sem_accum_buf)
 		S = sem_accum_buf + pix_id * SEMANTIC_CHANNELS; // global [H*W, S]
+	// LOCAL_SEMANTIC_CHANNELS > 0: local memory (thread-private, L1/L2 cached)
+	else if (LOCAL_SEMANTIC_CHANNELS > 0) S = S_local;
+	// LOCAL_SEMANTIC_CHANNELS == 0 + no sem_accum_buf: dynamic shared memory (fastest)
 	else // shared memory needs explicit init; global already zeroed
 	for (int ch = 0; ch < SEMANTIC_CHANNELS; ch++)
 		S[ch] = 0;
@@ -414,6 +420,21 @@ renderCUDA(
 	}
 }
 
+// Forward render: compile-time dispatch table
+// Entry i is renderCUDA<NUM_CHANNELS, i>.  Index 0 for shared/global tier,
+// index S for local-memory tier (exact S floats per thread).
+template <uint32_t... Is>
+static inline std::array<const void*, sizeof...(Is)>
+buildKernels(std::integer_sequence<uint32_t, Is...>) {
+    return { (const void*)renderCUDA<NUM_CHANNELS, Is>... };
+}
+static inline const std::array<const void*, MAX_LOCAL_SEMANTIC_CHANNELS + 1>&
+kernels() {
+    static const auto table =
+        buildKernels(std::make_integer_sequence<uint32_t, MAX_LOCAL_SEMANTIC_CHANNELS + 1>{});
+    return table;
+}
+
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
@@ -433,37 +454,43 @@ void FORWARD::render(
 {
 	size_t shared_mem_size = S * BLOCK_SIZE * sizeof(float);
 	float* sem_accum_buf = nullptr;
+	auto kernel = kernels()[0]; // 0 => shared/global tier
 
 	// Detect if we can use shared memory for semantic accumulation.
 	cudaDeviceProp prop;
 	cudaGetDeviceProperties(&prop, 0);
 	if (shared_mem_size > prop.sharedMemPerBlockOptin) {
-		// If not, allocate a global memory buffer for semantic accumulation (slower but larger).
+		// If not, allocate a local/global memory buffer for semantic accumulation (slower but larger).
+		if (S <= MAX_LOCAL_SEMANTIC_CHANNELS) 
+			kernel = kernels()[S];
+		else {
 		cudaMalloc(&sem_accum_buf, shared_mem_size);
 		cudaMemset(sem_accum_buf, 0, shared_mem_size);
+		}
 		shared_mem_size = 0; // no shared memory needed if using global buffer.
 	}
 
 	cudaFuncSetAttribute(
-		renderCUDA<NUM_CHANNELS>,
+		kernel,
 		cudaFuncAttributeMaxDynamicSharedMemorySize,
 		shared_mem_size); // shared memory size limit ~100KB
-	renderCUDA<NUM_CHANNELS> << <grid, block, shared_mem_size >> > (
-		ranges,
-		point_list,
-		W, H, S,
-		means2D,
-		colors,
-		semantics,
-		conic_opacity,
-		final_T,
-		n_contrib,
-		bg_color,
-		out_color,
-		out_feature_map,
-		depths, 
-		depth,
-		sem_accum_buf);
+	void* args[] = {
+		(void*)&ranges,
+		(void*)&point_list,
+		(void*)&W, (void*)&H, (void*)&S,
+		(void*)&means2D,
+		(void*)&colors,
+		(void*)&semantics,
+		(void*)&conic_opacity,
+		(void*)&final_T,
+		(void*)&n_contrib,
+		(void*)&bg_color,
+		(void*)&out_color,
+		(void*)&out_feature_map,
+		(void*)&depths, 
+		(void*)&depth,
+		(void*)&sem_accum_buf};
+	cudaLaunchKernel(kernel, grid, block, args, shared_mem_size, 0);
 
 	if (sem_accum_buf) cudaFree(sem_accum_buf);
 }
