@@ -287,7 +287,10 @@ renderCUDA(
 	float* __restrict__ out_color,
 	float* __restrict__ out_feature_map,
 	const float* __restrict__ depths,
-	float* __restrict__ invdepth)
+	float* __restrict__ invdepth,
+	// Per-pixel semantic accumulator in global memory (layout [H*W, S]).
+	// nullptr → use shared memory (fast); non-null → use this global memory (slow but larger).
+	float* __restrict__ sem_accum_buf)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -322,6 +325,9 @@ renderCUDA(
 	// Dynamic shared memory for per-thread semantic accumulators
 	extern __shared__ float s_semantic[];
 	float* S = s_semantic + block.thread_rank() * SEMANTIC_CHANNELS;
+	if (sem_accum_buf)
+		S = sem_accum_buf + pix_id * SEMANTIC_CHANNELS; // global [H*W, S]
+	else // shared memory needs explicit init; global already zeroed
 	for (int ch = 0; ch < SEMANTIC_CHANNELS; ch++)
 		S[ch] = 0;
 
@@ -426,6 +432,18 @@ void FORWARD::render(
 	float* depth)
 {
 	size_t shared_mem_size = S * BLOCK_SIZE * sizeof(float);
+	float* sem_accum_buf = nullptr;
+
+	// Detect if we can use shared memory for semantic accumulation.
+	cudaDeviceProp prop;
+	cudaGetDeviceProperties(&prop, 0);
+	if (shared_mem_size > prop.sharedMemPerBlockOptin) {
+		// If not, allocate a global memory buffer for semantic accumulation (slower but larger).
+		cudaMalloc(&sem_accum_buf, shared_mem_size);
+		cudaMemset(sem_accum_buf, 0, shared_mem_size);
+		shared_mem_size = 0; // no shared memory needed if using global buffer.
+	}
+
 	cudaFuncSetAttribute(
 		renderCUDA<NUM_CHANNELS>,
 		cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -444,7 +462,10 @@ void FORWARD::render(
 		out_color,
 		out_feature_map,
 		depths, 
-		depth);
+		depth,
+		sem_accum_buf);
+
+	if (sem_accum_buf) cudaFree(sem_accum_buf);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
