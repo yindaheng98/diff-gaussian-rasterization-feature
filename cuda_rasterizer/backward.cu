@@ -13,6 +13,7 @@
 #include "auxiliary.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <array>
 namespace cg = cooperative_groups;
 
 __device__ __forceinline__ float sq(float x) { return x * x; }
@@ -449,7 +450,7 @@ __global__ void preprocessCUDA(
 }
 
 // Backward version of the rendering procedure.
-template <uint32_t C>
+template <uint32_t C, uint32_t LOCAL_S>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -509,7 +510,9 @@ renderCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	float* collected_semantics = s_shared;
-	if (accum_semantics_rec_buf && last_semantics_buf && dL_dsemanticpixel_buf)
+	// collected_semantics uses shared memory only when the full shared-memory tier is active
+	// (no global bufs AND no local arrays).
+	if ((accum_semantics_rec_buf && last_semantics_buf && dL_dsemanticpixel_buf) || (LOCAL_S > 0))
 		collected_semantics = nullptr;
 	__shared__ float collected_depths[BLOCK_SIZE];
 
@@ -526,15 +529,19 @@ renderCUDA(
 
 	float accum_rec[C] = { 0 };
 	float* accum_semantics_rec = s_shared + S * BLOCK_SIZE + tid * S;
+	float accum_semantics_rec_local[LOCAL_S > 0 ? LOCAL_S : 1] = { 0 };
 	if (accum_semantics_rec_buf) 
 		accum_semantics_rec = accum_semantics_rec_buf + pix_id * S;
+	else if (LOCAL_S > 0) accum_semantics_rec = accum_semantics_rec_local;
 	else // shared memory needs explicit init; global already zeroed
 	for (int i = 0; i < S; i++)
 		accum_semantics_rec[i] = 0;
 	float dL_dpixel[C];
 	float* dL_dsemanticpixel = s_shared + 2 * S * BLOCK_SIZE + tid * S;
+	float dL_dsemanticpixel_local[LOCAL_S > 0 ? LOCAL_S : 1] = { 0 };
 	if (dL_dsemanticpixel_buf) 
 		dL_dsemanticpixel = dL_dsemanticpixel_buf + pix_id * S;
+	else if (LOCAL_S > 0) dL_dsemanticpixel = dL_dsemanticpixel_local;
 	float dL_invdepth;
 	float accum_invdepth_rec = 0;
 	if (inside)
@@ -550,8 +557,10 @@ renderCUDA(
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
 	float* last_semantics = s_shared + 3 * S * BLOCK_SIZE + tid * S;
+	float last_semantics_local[LOCAL_S > 0 ? LOCAL_S : 1] = { 0 };
 	if (last_semantics_buf)
 		last_semantics = last_semantics_buf + pix_id * S;
+	else if (LOCAL_S > 0) last_semantics = last_semantics_local;
 	else
 	for (int i = 0; i < S; i++)
 		last_semantics[i] = 0;
@@ -767,6 +776,21 @@ void BACKWARD::preprocess(
 		dL_dopacity);
 }
 
+// Backward render: compile-time dispatch table
+// Entry i is renderCUDA<NUM_CHANNELS, i>.  Index 0 for shared/global tier,
+// index S for local-memory tier (exact S floats per thread).
+template <uint32_t... Is>
+static inline std::array<const void*, sizeof...(Is)>
+buildKernels(std::integer_sequence<uint32_t, Is...>) {
+    return { (const void*)renderCUDA<NUM_CHANNELS, Is>... };
+}
+static inline const std::array<const void*, MAX_LOCAL_SEMANTIC_CHANNELS + 1>&
+kernels() {
+    static const auto table =
+        buildKernels(std::make_integer_sequence<uint32_t, MAX_LOCAL_SEMANTIC_CHANNELS + 1>{});
+    return table;
+}
+
 void BACKWARD::render(
 	const dim3 grid, const dim3 block,
 	const uint2* ranges,
@@ -794,12 +818,16 @@ void BACKWARD::render(
 	float* accum_semantics_rec  = nullptr;
 	float* last_semantics       = nullptr;
 	float* dL_dsemanticpixel    = nullptr;
+	auto kernel = kernels()[0]; // 0 => shared/global tier
 
 	// Detect if we can use shared memory for semantic accumulation.
 	cudaDeviceProp prop;
 	cudaGetDeviceProperties(&prop, 0);
 	if (shared_mem_size > prop.sharedMemPerBlockOptin) {
-		// If not, allocate a global memory buffer for semantic accumulation (slower but larger).
+		// If not, allocate a local/global memory buffer for semantic accumulation (slower but larger).
+		if (S <= MAX_LOCAL_SEMANTIC_CHANNELS) 
+			kernel = kernels()[S];
+		else {
 		size_t sem_buf_bytes = S * H * W * sizeof(float);
 		cudaMalloc(&accum_semantics_rec,  sem_buf_bytes);
 		cudaMalloc(&last_semantics,       sem_buf_bytes);
@@ -807,37 +835,38 @@ void BACKWARD::render(
 		cudaMemset(accum_semantics_rec, 0, sem_buf_bytes);
 		cudaMemset(last_semantics,      0, sem_buf_bytes);
 		cudaMemset(dL_dsemanticpixel,   0, sem_buf_bytes);
+		}
 		shared_mem_size = 0; // no shared memory needed if using global buffer.
 	}
 	cudaFuncSetAttribute(
-		renderCUDA<NUM_CHANNELS>,
+		kernel,
 		cudaFuncAttributeMaxDynamicSharedMemorySize,
 		shared_mem_size); // shared memory size limit ~100KB
-	renderCUDA<NUM_CHANNELS> << <grid, block, shared_mem_size >> >(
-		ranges,
-		point_list,
-		W, H, S,
-		bg_color,
-		means2D,
-		conic_opacity,
-		colors,
-		semantics,
-		depths,
-		final_Ts,
-		n_contrib,
-		dL_dpixels,
-		dL_dsemanticpixels,
-		dL_invdepths,
-		dL_dmean2D,
-		dL_dconic2D,
-		dL_dopacity,
-		dL_dcolors,
-		dL_dsemantics,
-		dL_dinvdepths,
-		accum_semantics_rec,
-		last_semantics,
-		dL_dsemanticpixel
-		);
+	void* args[] = {
+		(void*)&ranges,
+		(void*)&point_list,
+		(void*)&W, (void*)&H, (void*)&S,
+		(void*)&bg_color,
+		(void*)&means2D,
+		(void*)&conic_opacity,
+		(void*)&colors,
+		(void*)&semantics,
+		(void*)&depths,
+		(void*)&final_Ts,
+		(void*)&n_contrib,
+		(void*)&dL_dpixels,
+		(void*)&dL_dsemanticpixels,
+		(void*)&dL_invdepths,
+		(void*)&dL_dmean2D,
+		(void*)&dL_dconic2D,
+		(void*)&dL_dopacity,
+		(void*)&dL_dcolors,
+		(void*)&dL_dsemantics,
+		(void*)&dL_dinvdepths,
+		(void*)&accum_semantics_rec,
+		(void*)&last_semantics,
+		(void*)&dL_dsemanticpixel};
+	cudaLaunchKernel(kernel, grid, block, args, shared_mem_size, 0);
 
 	if (accum_semantics_rec) cudaFree(accum_semantics_rec);
 	if (last_semantics)      cudaFree(last_semantics);
