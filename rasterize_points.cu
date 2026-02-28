@@ -40,10 +40,10 @@ std::function<float*(size_t N)> resizeFunctionalFloat(torch::Tensor& t) {
     return lambda;
 }
 
-std::function<float*(size_t N)> resizeFunctionalFloat2D(torch::Tensor& t, size_t size_dim2) {
+std::function<int*(size_t N)> resizeFunctionalInt2D(torch::Tensor& t, size_t size_dim2) {
     auto lambda = [&t, size_dim2](size_t N) {
         t.resize_({(long long)N, (long long)size_dim2});
-		return reinterpret_cast<float*>(t.contiguous().data_ptr());
+		return reinterpret_cast<int*>(t.contiguous().data_ptr());
     };
     return lambda;
 }
@@ -76,7 +76,6 @@ RasterizeGaussiansCUDA(
 	const int degree,
 	const torch::Tensor& campos,
 	const float fusion_alpha_threshold,
-	const torch::Tensor& feature_map,
 	const bool prefiltered,
 	const bool antialiasing,
 	const bool debug)
@@ -89,20 +88,15 @@ RasterizeGaussiansCUDA(
   const int H = image_height;
   const int W = image_width;
 
-  if (feature_map.ndimension() != 3 || feature_map.size(0) != image_height || feature_map.size(1) != image_width) {
-    AT_ERROR("feature_map must have dimensions (image_height, image_width, num_features)");
-  }
-  const int n_features = feature_map.size(2);
-
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor out_invdepth = torch::full({0, H, W}, 0.0, float_opts);
-  torch::Tensor out_feature = torch::empty({0, n_features}, float_opts);
+  torch::Tensor out_feature = torch::empty({0, 2}, int_opts);
   torch::Tensor out_feature_alpha = torch::empty({0}, float_opts);
   torch::Tensor out_pixhit = torch::empty({0}, int_opts);
-  torch::Tensor out_feature_idx = torch::full({P}, -1, int_opts);
+  torch::Tensor out_feature_idx = torch::empty({0}, int_opts);
   float* out_invdepthptr = nullptr;
 
   out_invdepth = torch::full({1, H, W}, 0.0, float_opts).contiguous();
@@ -117,9 +111,10 @@ RasterizeGaussiansCUDA(
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
-  std::function<float*(size_t)> featureFunc = resizeFunctionalFloat2D(out_feature, (size_t)n_features);
+  std::function<int*(size_t)> featureFunc = resizeFunctionalInt2D(out_feature, (size_t)2);
   std::function<float*(size_t)> featureAlphaFunc = resizeFunctionalFloat(out_feature_alpha);
   std::function<int*(size_t)> pixHitFunc = resizeFunctionalInt(out_pixhit);
+  std::function<int*(size_t)> featureIdxFunc = resizeFunctionalInt(out_feature_idx);
   
   int rendered = 0;
   if(P != 0)
@@ -154,13 +149,11 @@ RasterizeGaussiansCUDA(
 		out_color.contiguous().data<float>(),
 		out_invdepthptr,
 		antialiasing,
-		n_features,
 		fusion_alpha_threshold,
-		feature_map.contiguous().data<float>(),
 		featureFunc,
 		featureAlphaFunc,
 		pixHitFunc,
-		out_feature_idx.contiguous().data<int>(),
+		featureIdxFunc,
 		radii.contiguous().data<int>(),
 		debug);
   }

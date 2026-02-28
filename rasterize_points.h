@@ -35,7 +35,6 @@ RasterizeGaussiansCUDA(
 	const int degree,
 	const torch::Tensor& campos,
 	const float fusion_alpha_threshold,
-	const torch::Tensor& feature_map,
 	const bool prefiltered,
 	const bool antialiasing,
 	const bool debug);

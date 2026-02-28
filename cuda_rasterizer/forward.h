@@ -46,7 +46,6 @@ namespace FORWARD
 		const dim3 grid,
 		uint32_t* tiles_touched,
 		int* visiable_count,
-		int* out_feature_idx,
 		bool prefiltered,
 		bool antialiasing);
 
@@ -65,10 +64,8 @@ namespace FORWARD
 		float* out_color,
 		float* depths,
 		float* depth,
-		const int n_features,
 		const float fusion_alpha_threshold,
-		float* feature_map,
-		float* out_feature,
+		int* out_feature,
 		float* out_feature_alpha,
 		int* out_pixhit,
 		int* out_feature_idx);

@@ -174,7 +174,6 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	int* visiable_count,
-	int* out_feature_idx,
 	bool prefiltered,
 	bool antialiasing)
 {
@@ -270,7 +269,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 
 	// If Gaussian is visible, increment counter.
-	out_feature_idx[idx] = atomicAdd(visiable_count, 1);
+	atomicAdd(visiable_count, 1);
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -291,10 +290,8 @@ renderCUDA(
 	float* __restrict__ out_color,
 	const float* __restrict__ depths,
 	float* __restrict__ invdepth,
-	const int n_features,
 	const float fusion_alpha_threshold,
-	float* __restrict__ feature_map,
-	float* __restrict__ out_feature,
+	int* __restrict__ out_feature,
 	float* __restrict__ out_feature_alpha,
 	int* __restrict__ out_pixhit,
 	int* __restrict__ out_feature_idx)
@@ -307,8 +304,6 @@ renderCUDA(
 	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	uint32_t pix_id = W * pix.y + pix.x;
 	float2 pixf = { (float)pix.x, (float)pix.y };
-
-	float* pix_feature_map = feature_map + pix_id * n_features;
 
 	// Check if this thread is associated with a valid pixel or outside.
 	bool inside = pix.x < W&& pix.y < H;
@@ -349,6 +344,10 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			int list_idx = range.x + progress;
+			out_feature[list_idx * 2] = static_cast<int>(block.group_index().x);
+			out_feature[list_idx * 2 + 1] = static_cast<int>(block.group_index().y);
+			out_feature_idx[list_idx] = coll_id;
 		}
 		block.sync();
 
@@ -389,9 +388,7 @@ renderCUDA(
 			// Feature fusion.
 			if (blend_alpha > fusion_alpha_threshold)
 			{	
-				int idx = out_feature_idx[collected_id[j]];
-				for (int ch = 0; ch < n_features; ch++)
-					atomicAdd(&(out_feature[idx * n_features + ch]), pix_feature_map[ch] * blend_alpha);
+				int idx = range.x + i * BLOCK_SIZE + j;
 				atomicAdd(&(out_feature_alpha[idx]), blend_alpha);
 				atomicAdd(&(out_pixhit[idx]), 1);
 			}
@@ -435,10 +432,8 @@ void FORWARD::render(
 	float* out_color,
 	float* depths,
 	float* depth,
-	const int n_features,
 	const float fusion_alpha_threshold,
-	float* feature_map,
-	float* out_feature,
+	int* out_feature,
 	float* out_feature_alpha,
 	int* out_pixhit,
 	int* out_feature_idx)
@@ -456,9 +451,7 @@ void FORWARD::render(
 		out_color,
 		depths, 
 		depth,
-		n_features,
 		fusion_alpha_threshold,
-		feature_map,
 		out_feature,
 		out_feature_alpha,
 		out_pixhit,
@@ -490,7 +483,6 @@ void FORWARD::preprocess(int P, int D, int M,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	int* visiable_count,
-	int* out_feature_idx,
 	bool prefiltered,
 	bool antialiasing)
 {
@@ -520,7 +512,6 @@ void FORWARD::preprocess(int P, int D, int M,
 		grid,
 		tiles_touched,
 		visiable_count,
-		out_feature_idx,
 		prefiltered,
 		antialiasing
 		);
