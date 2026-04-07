@@ -269,8 +269,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 
-	// If Gaussian is visible, increment counter.
-	out_feature_idx[idx] = atomicAdd(visiable_count, 1);
+	// Use the original Gaussian index as the stable output slot.
+	out_feature_idx[idx] = idx;
 }
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -389,7 +389,7 @@ renderCUDA(
 			// Feature fusion.
 			if (blend_alpha > fusion_alpha_threshold)
 			{	
-				int idx = out_feature_idx[collected_id[j]];
+				int idx = collected_id[j];
 				for (int ch = 0; ch < n_features; ch++)
 					atomicAdd(&(out_feature[idx * n_features + ch]), pix_feature_map[ch] * blend_alpha);
 				atomicAdd(&(out_feature_alpha[idx]), blend_alpha);
