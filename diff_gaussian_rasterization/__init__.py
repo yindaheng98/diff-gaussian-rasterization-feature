@@ -88,9 +88,10 @@ class _RasterizeGaussians(torch.autograd.Function):
         # Invoke C++/CUDA rasterizer
         num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, invdepths, features, features_alpha, pixhit, features_idx = _C.pixel_feature_fusion(*args)
         visiable_gaussians_idx = (features_idx >= 0).nonzero().squeeze(-1)
-        visiable_feature_idx = features_idx[visiable_gaussians_idx]
-        features_idx = torch.zeros_like(visiable_gaussians_idx)
-        features_idx[visiable_feature_idx] = visiable_gaussians_idx
+        features = features[visiable_gaussians_idx].contiguous()
+        features_alpha = features_alpha[visiable_gaussians_idx].contiguous()
+        pixhit = pixhit[visiable_gaussians_idx].contiguous()
+        features_idx = visiable_gaussians_idx.contiguous()
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
